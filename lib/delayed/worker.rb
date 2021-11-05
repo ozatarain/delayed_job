@@ -9,20 +9,30 @@ require 'benchmark'
 
 module Delayed
   class Worker # rubocop:disable ClassLength
-    DEFAULT_LOG_LEVEL        = 'info'.freeze
-    DEFAULT_SLEEP_DELAY      = 5
-    DEFAULT_MAX_ATTEMPTS     = 25
-    DEFAULT_MAX_RUN_TIME     = 4.hours
-    DEFAULT_DEFAULT_PRIORITY = 0
-    DEFAULT_DELAY_JOBS       = true
-    DEFAULT_QUEUES           = [].freeze
-    DEFAULT_QUEUE_ATTRIBUTES = HashWithIndifferentAccess.new.freeze
-    DEFAULT_READ_AHEAD       = 5
+    DEFAULT_LOG_LEVEL               = 'info'.freeze
+    DEFAULT_SLEEP_DELAY             = 5
+    DEFAULT_MAX_ATTEMPTS            = 25
+    DEFAULT_MAX_RUN_TIME            = 4.hours
+    DEFAULT_DEFAULT_PRIORITY        = 0
+    DEFAULT_DELAY_JOBS              = true
+    DEFAULT_QUEUES                  = [].freeze
+    DEFAULT_QUEUE_ATTRIBUTES        = HashWithIndifferentAccess.new.freeze
+    DEFAULT_READ_AHEAD              = 5
+    DEFAULT_MAX_RESCHEDULE_ATTEMPTS = 5
 
-    cattr_accessor :min_priority, :max_priority, :max_attempts, :max_run_time,
-                   :default_priority, :sleep_delay, :logger, :delay_jobs, :queues,
-                   :read_ahead, :plugins, :destroy_failed_jobs, :exit_on_complete,
-                   :default_log_level
+    CONFIGURABLE_FIELDS = %i{
+      min_priority
+      max_priority
+      sleep_delay
+      read_ahead
+      queues
+      exit_on_complete
+      max_reschedule_attempts
+    }
+
+    cattr_accessor *CONFIGURABLE_FIELDS
+    cattr_accessor :max_attempts, :max_run_time, :default_priority, :logger, :delay_jobs,
+                   :plugins, :destroy_failed_jobs, :default_log_level
 
     # Named queue into which jobs are enqueued by default
     cattr_accessor :default_queue_name
@@ -33,16 +43,17 @@ module Delayed
     attr_accessor :name_prefix
 
     def self.reset
-      self.default_log_level = DEFAULT_LOG_LEVEL
-      self.sleep_delay       = DEFAULT_SLEEP_DELAY
-      self.max_attempts      = DEFAULT_MAX_ATTEMPTS
-      self.max_run_time      = DEFAULT_MAX_RUN_TIME
-      self.default_priority  = DEFAULT_DEFAULT_PRIORITY
-      self.delay_jobs        = DEFAULT_DELAY_JOBS
-      self.queues            = DEFAULT_QUEUES
-      self.queue_attributes  = DEFAULT_QUEUE_ATTRIBUTES
-      self.read_ahead        = DEFAULT_READ_AHEAD
-      @lifecycle             = nil
+      self.default_log_level        = DEFAULT_LOG_LEVEL
+      self.sleep_delay              = DEFAULT_SLEEP_DELAY
+      self.max_attempts             = DEFAULT_MAX_ATTEMPTS
+      self.max_run_time             = DEFAULT_MAX_RUN_TIME
+      self.default_priority         = DEFAULT_DEFAULT_PRIORITY
+      self.delay_jobs               = DEFAULT_DELAY_JOBS
+      self.queues                   = DEFAULT_QUEUES
+      self.queue_attributes         = DEFAULT_QUEUE_ATTRIBUTES
+      self.read_ahead               = DEFAULT_READ_AHEAD
+      self.max_reschedule_attempts  = DEFAULT_MAX_RESCHEDULE_ATTEMPTS
+      @lifecycle                    = nil
     end
 
     # Add or remove plugins in this list before the worker is instantiated
@@ -131,7 +142,7 @@ module Delayed
       @quiet = options.key?(:quiet) ? options[:quiet] : true
       @failed_reserve_count = 0
 
-      [:min_priority, :max_priority, :sleep_delay, :read_ahead, :queues, :exit_on_complete].each do |option|
+      CONFIGURABLE_FIELDS.each do |option|
         self.class.send("#{option}=", options[option]) if options.key?(option)
       end
 
@@ -245,14 +256,25 @@ module Delayed
     # Reschedule the job in the future (when a job fails).
     # Uses an exponential scale depending on the number of failed attempts.
     def reschedule(job, time = nil)
-      if (job.attempts += 1) < max_attempts(job)
-        time ||= job.reschedule_at
-        job.run_at = time
-        job.unlock
-        job.save!
-      else
-        job_say job, "FAILED permanently because of #{job.attempts} consecutive failures", 'error'
-        failed(job)
+      reschedule_retries = 0
+      job.attempts += 1
+
+      begin
+        if job.attempts < max_attempts(job)
+          time ||= job.reschedule_at
+          job.run_at = time
+          job.unlock
+          job.save!
+        else
+          job_say job, "FAILED permanently because of #{job.attempts} consecutive failures", 'error'
+          failed(job)
+        end
+      rescue => e
+        say "Error while rescheduling job: #{e}"
+        raise e if (reschedule_retries += 1) > self.class.max_reschedule_attempts
+
+        sleep(self.class.sleep_delay)
+        retry
       end
     end
 
